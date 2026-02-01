@@ -1,0 +1,25 @@
+# Downloaded media files
+audio/
+downloads/
+metadata/
+
+# Logs and task files
+*.log
+download.log
+tasks.txt
+
+# Library database (contains local paths)
+library.json
+
+# System files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
