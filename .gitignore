@@ -23,3 +23,6 @@ __pycache__/
 *.pyo
 .env
 venv/
+
+# Local Claude settings (contains user-specific paths)
+.claude/settings.local.json
