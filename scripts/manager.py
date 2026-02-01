@@ -24,6 +24,10 @@ METADATA_DIR = os.path.join(BASE_DIR, "metadata")
 TASKS_FILE = os.path.join(BASE_DIR, "tasks.txt")
 LOG_FILE = os.path.join(BASE_DIR, "download.log")
 
+# Ensure directories exist
+for d in [AUDIO_DIR, METADATA_DIR, DOWNLOADS_DIR]:
+    os.makedirs(d, exist_ok=True)
+
 # Environment without proxy for Bilibili (direct connection is faster/more stable)
 NO_PROXY_ENV = {k: v for k, v in os.environ.items()
                 if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
