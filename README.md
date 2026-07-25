@@ -16,8 +16,8 @@
 # 必需
 pip install yt-dlp
 
-# 元信息编辑（fix 命令需要）
-pip install mutagen
+# 元信息、原生 MP4 封面和 Apple Music 工作流（必需）
+python -m pip install mutagen
 ```
 
 ## 使用方法
@@ -35,6 +35,33 @@ python scripts/manager.py list
 # 整理元信息 + 获取歌词
 python scripts/manager.py fix
 ```
+
+## Bilibili 高码率与封面
+
+Bilibili 下载会写入标题、艺人和原生 MP4 `covr` 封面；艺人字段会追加 `AI音乐`，便于用 Apple Music 智能播放列表归类。此流程需要已安装的 `bili` 命令及 `mutagen`。
+
+对已入库的一位上传者，可将可用的高码率音频暂存到独立目录，补齐封面后再校验：
+
+```bash
+# 不覆盖 audio/；可安全重复执行
+python scripts/manager.py refresh-bilibili --uploader "<uploader>" ./audio-bilibili-192k
+
+# 为已有暂存文件写入原生 MP4 封面
+python scripts/manager.py fix-bilibili-covers --uploader "<uploader>" ./audio-bilibili-192k
+
+# 导入 Music 前验证：缺文件、低码率、缺封面或标签不符都会返回非零状态
+python scripts/manager.py verify-bilibili --uploader "<uploader>" ./audio-bilibili-192k
+```
+
+`verify-bilibili` 默认拒绝码率不高于 96 kbps 的文件；可通过 `--min-bitrate <bps>` 调整阈值。
+
+### 导入 Apple Music
+
+1. 在 Music 设置中确认“同步资料库”已开启，并定位“自动添加到 Music”文件夹。
+2. 只将 `verify-bilibili` 通过的 m4a 文件复制到该文件夹，等待 Music 完成导入与云端资料库更新。
+3. 用智能播放列表规则“艺人包含 `AI音乐`”自动收纳 Bilibili 下载。
+
+不要将 Music 资料库、自动导入文件夹、Apple ID、上传状态截图或下载音频提交到仓库。
 
 ## 目录结构
 

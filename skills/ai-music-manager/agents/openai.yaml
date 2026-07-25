@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Music Manager"
+  short_description: "Download, repair, validate, and import AI music"
+  default_prompt: "Use $ai-music-manager to download a collection, validate audio quality and artwork, then stage it for a local Music library."

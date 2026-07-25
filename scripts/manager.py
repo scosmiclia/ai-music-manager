@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -8,7 +9,7 @@ import urllib.parse
 from datetime import datetime
 
 try:
-    from mutagen.mp4 import MP4
+    from mutagen.mp4 import MP4, MP4Cover
     HAS_MUTAGEN = True
 except ImportError:
     HAS_MUTAGEN = False
@@ -171,13 +172,96 @@ def fetch_lyrics(song_name, artist=""):
         return ''
 
 
-def update_metadata(file_path, title, artist, lyrics=""):
+def fetch_bilibili_cover(video_id, cover_url):
+    """Download a Bilibili video's cover once and retain it beside its metadata."""
+    if not cover_url:
+        return None
+
+    # Bilibili's API normally serves JPEG artwork.  Keep a stable extension so
+    # Music and FFmpeg can infer the attached-picture format reliably.
+    cover_path = os.path.join(METADATA_DIR, f"{video_id}.cover.jpg")
+    if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
+        return cover_path
+
+    temporary_path = f"{cover_path}.part"
+    try:
+        request = urllib.request.Request(cover_url, headers={
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Referer': 'https://www.bilibili.com/',
+        })
+        with urllib.request.urlopen(request, timeout=30) as response, open(temporary_path, 'wb') as output:
+            shutil.copyfileobj(response, output)
+        if os.path.getsize(temporary_path) == 0:
+            raise RuntimeError("Bilibili returned an empty cover image")
+        os.replace(temporary_path, cover_path)
+        return cover_path
+    except Exception as e:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+        print(f"  ⚠ Failed to fetch Bilibili cover for {video_id}: {e}")
+        return None
+
+
+def cover_path_for_item(item):
+    """Return an item's cached Bilibili cover, downloading it when necessary."""
+    metadata_name = item.get("files", {}).get("metadata")
+    if not metadata_name:
+        return None
+    metadata_path = os.path.join(METADATA_DIR, metadata_name)
+    try:
+        with open(metadata_path, encoding="utf-8") as f:
+            cover_url = json.load(f).get("data", {}).get("pic")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return fetch_bilibili_cover(item["id"], cover_url)
+
+
+def update_metadata(file_path, title, artist, lyrics="", cover_path=None):
     """
-    Update m4a file metadata using mutagen.
+    Update m4a metadata without re-encoding the audio stream.
+
+    Mutagen is preferred for iTunes-native lyric tags.  The command-line
+    workflow must also work on a clean macOS Python installation, so FFmpeg is
+    used as a stream-copy fallback when Mutagen is unavailable.
     """
     if not HAS_MUTAGEN:
-        print("  ⚠ mutagen not installed. Run: pip install mutagen")
-        return False
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            print("  ⚠ Neither mutagen nor ffmpeg is available for metadata tagging")
+            return False
+
+        temporary_path = f"{file_path}.metadata.m4a"
+        try:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+            command = [ffmpeg, "-y", "-v", "error", "-i", file_path]
+            if cover_path:
+                command.extend(["-i", cover_path])
+            command.extend([
+                "-map", "0:a:0", "-map_metadata", "0",
+                "-c:a", "copy",
+                "-metadata", f"title={title}",
+                "-metadata", f"artist={artist}",
+                "-metadata", f"album_artist={artist}",
+            ])
+            if cover_path:
+                command.extend([
+                    "-map", "1:v:0", "-c:v", "mjpeg",
+                    "-disposition:v:0", "attached_pic",
+                    "-metadata:s:v:0", "title=Cover",
+                    "-metadata:s:v:0", "comment=Cover (front)",
+                ])
+            if lyrics:
+                command.extend(["-metadata", f"lyrics={lyrics}"])
+            command.append(temporary_path)
+            subprocess.run(command, check=True)
+            os.replace(temporary_path, file_path)
+            return True
+        except Exception as e:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+            print(f"  ✗ Failed to update metadata for {file_path}: {e}")
+            return False
 
     try:
         audio = MP4(file_path)
@@ -185,6 +269,10 @@ def update_metadata(file_path, title, artist, lyrics=""):
         audio["\xa9ART"] = [artist]      # Artist
         if lyrics:
             audio["\xa9lyr"] = [lyrics]  # Lyrics
+        if cover_path:
+            with open(cover_path, "rb") as cover_file:
+                image_format = MP4Cover.FORMAT_PNG if cover_path.lower().endswith(".png") else MP4Cover.FORMAT_JPEG
+                audio["covr"] = [MP4Cover(cover_file.read(), imageformat=image_format)]
         audio.save()
         return True
     except Exception as e:
@@ -279,6 +367,477 @@ def extract_bili_id(url):
     return match.group(1) if match else None
 
 
+def fetch_bilibili_metadata(video_id):
+    """Fetch Bilibili video metadata without relying on yt-dlp's Bilibili extractor."""
+    api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={urllib.parse.quote(video_id)}"
+    req = urllib.request.Request(api_url, headers={
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Referer': 'https://www.bilibili.com/'
+    })
+
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        info = json.loads(resp.read().decode('utf-8'))
+
+    if info.get('code') != 0 or not info.get('data'):
+        raise RuntimeError(f"Bilibili metadata request failed: {info.get('message', 'unknown error')}")
+
+    return info
+
+
+def _find_downloaded_audio(before_paths):
+    """Return the audio file newly produced by bili-cli in DOWNLOADS_DIR."""
+    candidates = []
+    for root, _, filenames in os.walk(DOWNLOADS_DIR):
+        for filename in filenames:
+            if filename.lower().endswith(('.m4a', '.mp3', '.aac', '.opus')):
+                path = os.path.join(root, filename)
+                if path not in before_paths:
+                    candidates.append(path)
+
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Expected one audio file from bili-cli, found {len(candidates)} new file(s): {candidates}"
+        )
+    return candidates[0]
+
+
+def _bili_cli_python():
+    """Return the Python runtime backing the installed ``bili`` command."""
+    bili_path = shutil.which("bili")
+    if not bili_path:
+        return None
+
+    try:
+        with open(bili_path, encoding="utf-8") as f:
+            shebang = f.readline().strip()
+    except OSError:
+        return None
+
+    if shebang.startswith("#!"):
+        return shebang[2:].split()[0]
+    return None
+
+
+def ai_music_artist(uploader):
+    """Keep Bilibili downloads eligible for the user's AI Music smart playlist."""
+    return f"{uploader} · AI音乐" if uploader else "AI音乐"
+
+
+def require_mutagen_for_bilibili_artwork():
+    """Require native MP4 artwork support for Apple Music-oriented Bilibili flows."""
+    if HAS_MUTAGEN:
+        return True
+    print(
+        "Error: mutagen is required for Bilibili artwork. "
+        "Install it with: python -m pip install mutagen"
+    )
+    return False
+
+
+HIGH_QUALITY_BILI_DOWNLOAD_SCRIPT = r'''
+import asyncio
+import os
+import sys
+
+from bilibili_api import video
+from bilibili_api.video import AudioQuality, VideoDownloadURLDataDetecter
+from bili_cli.client import download_audio
+from bili_cli.commands.common import get_credential
+
+
+async def main(bvid, output_path):
+    credential = get_credential(mode="optional")
+    source = video.Video(bvid=bvid, credential=credential)
+    download_data = await source.get_download_url(page_index=0)
+    detector = VideoDownloadURLDataDetecter(download_data)
+    streams = detector.detect_best_streams(
+        audio_max_quality=AudioQuality._192K,
+        no_dolby_audio=True,
+        no_hires=True,
+    )
+
+    audio_stream = None
+    if detector.check_flv_mp4_stream():
+        if streams and getattr(streams[0], "url", None):
+            audio_stream = streams[0]
+    elif len(streams) >= 2 and getattr(streams[1], "audio_quality", None):
+        audio_stream = streams[1]
+
+    if audio_stream is None:
+        for stream in streams:
+            if getattr(stream, "audio_quality", None) and getattr(stream, "url", None):
+                audio_stream = stream
+                break
+    if audio_stream is None:
+        raise RuntimeError("Bilibili did not provide an audio stream")
+
+    partial_path = output_path + ".part"
+    urls = [audio_stream.url, *getattr(audio_stream, "backup_url", [])]
+    errors = []
+    for stream_url in dict.fromkeys(urls):
+        if os.path.exists(partial_path):
+            os.unlink(partial_path)
+        try:
+            await download_audio(stream_url, partial_path)
+            os.replace(partial_path, output_path)
+            break
+        except Exception as exc:
+            errors.append(f"{stream_url.split('/')[2]}: {exc}")
+    else:
+        raise RuntimeError("All Bilibili audio CDN URLs failed: " + "; ".join(errors))
+    quality = getattr(audio_stream.audio_quality, "value", audio_stream.audio_quality)
+    print(f"Downloaded Bilibili audio quality: {quality}")
+
+
+asyncio.run(main(sys.argv[1], sys.argv[2]))
+'''
+
+
+def download_bilibili_audio(video_id):
+    """Download the highest non-Dolby Bilibili audio stream available."""
+    before_paths = {
+        os.path.join(root, filename)
+        for root, _, filenames in os.walk(DOWNLOADS_DIR)
+        for filename in filenames
+        if filename.lower().endswith((".m4a", ".mp3", ".aac", ".opus"))
+    }
+    output_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.m4a")
+    bili_python = _bili_cli_python()
+
+    if bili_python:
+        print(f"Downloading highest available Bilibili audio for {video_id}...")
+        subprocess.run(
+            [bili_python, "-c", HIGH_QUALITY_BILI_DOWNLOAD_SCRIPT, video_id, output_path],
+            check=True,
+            env=NO_PROXY_ENV,
+        )
+    else:
+        # Keep the existing CLI route usable on installations that do not expose
+        # the bili-cli Python runtime. It may be limited to 64 kbps.
+        print("Could not inspect bili-cli runtime; falling back to its default audio stream.")
+        subprocess.run(
+            ["bili", "audio", video_id, "--no-split", "--output", DOWNLOADS_DIR],
+            check=True,
+            env=NO_PROXY_ENV,
+        )
+
+    return _find_downloaded_audio(before_paths)
+
+
+def download_bilibili(video_id):
+    """Download a Bilibili video as m4a with bili-cli and add it to the local library."""
+    if not require_mutagen_for_bilibili_artwork():
+        raise RuntimeError("Native MP4 artwork support is unavailable")
+
+    library = load_library()
+    if any(item['id'] == video_id for item in library['items']):
+        print("Item already in library.")
+        return
+
+    info = fetch_bilibili_metadata(video_id)
+    video = info['data']
+    title = video.get('title') or video_id
+    uploader = video.get('owner', {}).get('name', '')
+    source_url = f"https://www.bilibili.com/video/{video_id}"
+    cover_path = fetch_bilibili_cover(video_id, video.get('pic'))
+
+    meta_path = os.path.join(METADATA_DIR, f"{video_id}.json")
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(info, f, indent=2, ensure_ascii=False)
+
+    downloaded_audio = download_bilibili_audio(video_id)
+    audio_filename = f"{title} [{video_id}].m4a"
+    audio_path = os.path.join(AUDIO_DIR, audio_filename)
+    os.replace(downloaded_audio, audio_path)
+
+    # The Bilibili audio endpoint does not provide useful Apple Music tags.
+    # Include the smart-playlist marker while keeping the UP name visible.
+    if not update_metadata(
+        audio_path,
+        title,
+        ai_music_artist(uploader),
+        cover_path=cover_path,
+    ):
+        raise RuntimeError(f"Could not write Bilibili metadata for {video_id}")
+
+    library['items'].append({
+        "id": video_id,
+        "title": title,
+        "uploader": uploader,
+        "source_url": source_url,
+        "downloaded_at": datetime.now().isoformat(),
+        "files": {
+            "audio": audio_filename,
+            "metadata": f"{video_id}.json",
+            **({"cover": os.path.basename(cover_path)} if cover_path else {}),
+        }
+    })
+    save_library(library)
+    print(f"Successfully added '{title}' to library.")
+
+
+def audio_bitrate(file_path):
+    """Return the first audio stream's bitrate in bits per second."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=bit_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1", file_path,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return int(result.stdout.strip())
+
+
+def has_embedded_cover(file_path):
+    """Return whether an M4A has artwork that the current tagger can read."""
+    if HAS_MUTAGEN:
+        try:
+            audio = MP4(file_path)
+            return bool(audio.tags and audio.tags.get("covr"))
+        except Exception:
+            return False
+
+    # The FFmpeg fallback cannot write the iTunes-native ``covr`` atom, but an
+    # attached picture remains the best artwork representation it can produce.
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "stream=codec_type:stream_disposition=attached_pic",
+            "-of", "json", file_path,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    streams = json.loads(result.stdout).get("streams", [])
+    return any(
+        stream.get("codec_type") == "video"
+        and stream.get("disposition", {}).get("attached_pic") == 1
+        for stream in streams
+    )
+
+
+def fix_bilibili_covers(uploader, input_dir=None, limit=None):
+    """Embed cached Bilibili cover art into already-downloaded audio files."""
+    if not require_mutagen_for_bilibili_artwork():
+        return 1
+
+    source_dir = input_dir or os.path.join(BASE_DIR, "audio-bilibili-192k")
+    library = load_library()
+    items = [
+        item for item in library["items"]
+        if item.get("source_url", "").startswith("https://www.bilibili.com/video/")
+        and item.get("uploader") == uploader
+    ]
+
+    processed = 0
+    successes = 0
+    failures = []
+    for index, item in enumerate(items, 1):
+        if limit is not None and processed >= limit:
+            break
+        audio_filename = item.get("files", {}).get("audio") or f"{item['id']}.m4a"
+        audio_path = os.path.join(source_dir, audio_filename)
+        if not os.path.isfile(audio_path):
+            continue
+        if has_embedded_cover(audio_path):
+            successes += 1
+            continue
+
+        processed += 1
+        try:
+            cover_path = cover_path_for_item(item)
+            if not cover_path:
+                raise RuntimeError("cover URL is missing or could not be downloaded")
+            if not update_metadata(
+                audio_path,
+                item.get("title") or item["id"],
+                ai_music_artist(item.get("uploader", "")),
+                cover_path=cover_path,
+            ):
+                raise RuntimeError("metadata update failed")
+            if not has_embedded_cover(audio_path):
+                raise RuntimeError("cover was not embedded")
+            successes += 1
+            print(f"COVER_PROGRESS {index}/{len(items)} {item['id']}", flush=True)
+        except Exception as exc:
+            failures.append((item["id"], str(exc)))
+            print(f"COVER_ERROR {index}/{len(items)} {item['id']}: {exc}", flush=True)
+
+    print(
+        f"COVER_SUMMARY covered={successes} processed={processed} "
+        f"failed={len(failures)} total={len(items)}",
+        flush=True,
+    )
+    for video_id, error in failures:
+        print(f"COVER_FAILURE {video_id}: {error}", flush=True)
+    return len(failures)
+
+
+def verify_bilibili_media(uploader, input_dir=None, min_bitrate=96000):
+    """Verify bitrate, native artwork, and Music metadata for staged Bilibili audio."""
+    if not require_mutagen_for_bilibili_artwork():
+        return 1
+
+    source_dir = input_dir or os.path.join(BASE_DIR, "audio-bilibili-192k")
+    library = load_library()
+    items = [
+        item for item in library["items"]
+        if item.get("source_url", "").startswith("https://www.bilibili.com/video/")
+        and item.get("uploader") == uploader
+    ]
+    if not items:
+        print(f"No Bilibili library items to verify for UP: {uploader}")
+        return 1
+
+    missing = []
+    low_bitrate = []
+    missing_cover = []
+    tag_mismatch = []
+    errors = []
+    present = 0
+    for item in items:
+        video_id = item["id"]
+        audio_filename = item.get("files", {}).get("audio") or f"{video_id}.m4a"
+        audio_path = os.path.join(source_dir, audio_filename)
+        if not os.path.isfile(audio_path):
+            missing.append(video_id)
+            continue
+        present += 1
+        try:
+            if audio_bitrate(audio_path) <= min_bitrate:
+                low_bitrate.append(video_id)
+            if not has_embedded_cover(audio_path):
+                missing_cover.append(video_id)
+            tags = MP4(audio_path).tags or {}
+            expected_title = item.get("title") or video_id
+            expected_artist = ai_music_artist(item.get("uploader", ""))
+            actual_title = str((tags.get("\xa9nam") or [""])[0])
+            actual_artist = str((tags.get("\xa9ART") or [""])[0])
+            if actual_title != expected_title or actual_artist != expected_artist:
+                tag_mismatch.append(video_id)
+        except Exception as exc:
+            errors.append((video_id, str(exc)))
+
+    print(
+        f"VERIFY_SUMMARY total={len(items)} present={present} missing={len(missing)} "
+        f"low_bitrate={len(low_bitrate)} missing_cover={len(missing_cover)} "
+        f"tag_mismatch={len(tag_mismatch)} errors={len(errors)}",
+        flush=True,
+    )
+    for video_id, error in errors:
+        print(f"VERIFY_ERROR {video_id}: {error}", flush=True)
+    return len(missing) + len(low_bitrate) + len(missing_cover) + len(tag_mismatch) + len(errors)
+
+
+def refresh_bilibili(uploader, output_dir=None, limit=None):
+    """Stage high-quality Bilibili source files for one UP's library items.
+
+    The existing ``audio`` directory and Music.app library are not modified.
+    The command is restartable: an already-verified staged file is retained,
+    while missing items are retried through the primary and backup CDNs.
+    """
+    if not require_mutagen_for_bilibili_artwork():
+        return 1
+
+    destination = output_dir or os.path.join(BASE_DIR, "audio-bilibili-192k")
+    os.makedirs(destination, exist_ok=True)
+    library = load_library()
+    items = [
+        item for item in library["items"]
+        if item.get("source_url", "").startswith("https://www.bilibili.com/video/")
+        and item.get("uploader") == uploader
+    ]
+
+    if not items:
+        print(f"No Bilibili library items to refresh for UP: {uploader}")
+        return 0
+
+    successes = 0
+    downloads_started = 0
+    failures = []
+    for index, item in enumerate(items, 1):
+        video_id = item["id"]
+        title = item.get("title") or video_id
+        uploader = item.get("uploader", "")
+        audio_filename = item.get("files", {}).get("audio") or f"{video_id}.m4a"
+        target = os.path.join(destination, audio_filename)
+        cover_path = cover_path_for_item(item)
+
+        if os.path.exists(target):
+            try:
+                if not update_metadata(
+                    target,
+                    title,
+                    ai_music_artist(uploader),
+                    cover_path=cover_path,
+                ):
+                    raise RuntimeError("metadata update failed")
+                bitrate = audio_bitrate(target)
+                if bitrate <= 96000:
+                    raise RuntimeError(f"staged bitrate is too low: {bitrate}")
+                successes += 1
+                continue
+            except Exception as exc:
+                failures.append((video_id, str(exc)))
+                print(f"REFRESH_ERROR {index}/{len(items)} {video_id}: {exc}", flush=True)
+                continue
+
+        if limit is not None and downloads_started >= limit:
+            break
+        downloads_started += 1
+        downloaded_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.m4a")
+        partial_path = downloaded_path + ".part"
+        last_error = None
+        for attempt in range(1, 4):
+            for path in (downloaded_path, partial_path):
+                if os.path.exists(path):
+                    os.unlink(path)
+            try:
+                downloaded = download_bilibili_audio(video_id)
+                if not update_metadata(
+                    downloaded,
+                    title,
+                    ai_music_artist(uploader),
+                    cover_path=cover_path,
+                ):
+                    raise RuntimeError("metadata update failed")
+                os.replace(downloaded, target)
+                bitrate = audio_bitrate(target)
+                if bitrate <= 96000:
+                    os.unlink(target)
+                    raise RuntimeError(f"downloaded bitrate is too low: {bitrate}")
+                successes += 1
+                print(
+                    f"REFRESH_PROGRESS {index}/{len(items)} downloaded={video_id} "
+                    f"attempt={attempt} bitrate={bitrate}",
+                    flush=True,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"REFRESH_RETRY {index}/{len(items)} {video_id} "
+                    f"attempt={attempt}: {exc}",
+                    flush=True,
+                )
+        else:
+            failures.append((video_id, str(last_error)))
+            print(f"REFRESH_ERROR {index}/{len(items)} {video_id}: {last_error}", flush=True)
+
+    print(
+        f"REFRESH_SUMMARY verified={successes} attempted={downloads_started} "
+        f"failed={len(failures)} total={len(items)}",
+        flush=True,
+    )
+    for video_id, error in failures:
+        print(f"REFRESH_FAILURE {video_id}: {error}", flush=True)
+    return len(failures)
+
+
 def is_playlist_url(url):
     """Check if URL is a playlist/collection (合集) link."""
     # 合集格式: /lists/, favlist, or series
@@ -347,6 +906,12 @@ def save_library(library):
 
 def download(url):
     print(f"Downloading {url}...")
+
+    # Bilibili's yt-dlp extractor is currently blocked by Bilibili's 412
+    # anti-bot response. Use the dedicated bili-cli audio command instead.
+    video_id = extract_bili_id(url)
+    if video_id:
+        return download_bilibili(video_id)
 
     # Generate a unique ID (timestamp based for simplicity, or use yt-dlp id)
     # We let yt-dlp handle filename generation but capture the output ID
@@ -517,7 +1082,7 @@ def process_tasks():
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python manager.py [download <url> | list | process | fix]")
+        print("Usage: python manager.py [download <url> | list | process | fix | refresh-bilibili --uploader <name> [--limit <number>] [output-dir] | fix-bilibili-covers --uploader <name> [--limit <number>] [input-dir] | verify-bilibili --uploader <name> [--min-bitrate <bps>] [input-dir]]")
         sys.exit(1)
 
     action = sys.argv[1]
@@ -533,5 +1098,72 @@ if __name__ == "__main__":
         process_tasks()
     elif action == "fix":
         fix_metadata()
+    elif action == "refresh-bilibili":
+        if len(sys.argv) < 4 or sys.argv[2] != "--uploader":
+            print("Usage: python manager.py refresh-bilibili --uploader <name> [--limit <number>] [output-dir]")
+            sys.exit(1)
+        uploader = sys.argv[3]
+        remaining = sys.argv[4:]
+        limit = None
+        if remaining[:1] == ["--limit"]:
+            if len(remaining) < 2:
+                print("--limit requires a positive integer")
+                sys.exit(1)
+            limit = int(remaining[1])
+            if limit <= 0:
+                print("--limit requires a positive integer")
+                sys.exit(1)
+            remaining = remaining[2:]
+        if len(remaining) > 1:
+            print("Usage: python manager.py refresh-bilibili --uploader <name> [--limit <number>] [output-dir]")
+            sys.exit(1)
+        output_dir = remaining[0] if remaining else None
+        sys.exit(1 if refresh_bilibili(uploader, output_dir, limit) else 0)
+    elif action == "fix-bilibili-covers":
+        if len(sys.argv) < 4 or sys.argv[2] != "--uploader":
+            print("Usage: python manager.py fix-bilibili-covers --uploader <name> [--limit <number>] [input-dir]")
+            sys.exit(1)
+        uploader = sys.argv[3]
+        remaining = sys.argv[4:]
+        limit = None
+        if remaining[:1] == ["--limit"]:
+            if len(remaining) < 2:
+                print("--limit requires a positive integer")
+                sys.exit(1)
+            limit = int(remaining[1])
+            if limit <= 0:
+                print("--limit requires a positive integer")
+                sys.exit(1)
+            remaining = remaining[2:]
+        if len(remaining) > 1:
+            print("Usage: python manager.py fix-bilibili-covers --uploader <name> [--limit <number>] [input-dir]")
+            sys.exit(1)
+        input_dir = remaining[0] if remaining else None
+        sys.exit(1 if fix_bilibili_covers(uploader, input_dir, limit) else 0)
+    elif action == "verify-bilibili":
+        if len(sys.argv) < 4 or sys.argv[2] != "--uploader":
+            print("Usage: python manager.py verify-bilibili --uploader <name> [--min-bitrate <bps>] [input-dir]")
+            sys.exit(1)
+        uploader = sys.argv[3]
+        remaining = sys.argv[4:]
+        min_bitrate = 96000
+        if remaining[:1] == ["--min-bitrate"]:
+            if len(remaining) < 2:
+                print("--min-bitrate requires a positive integer")
+                sys.exit(1)
+            try:
+                min_bitrate = int(remaining[1])
+            except ValueError:
+                print("--min-bitrate requires a positive integer")
+                sys.exit(1)
+            if min_bitrate <= 0:
+                print("--min-bitrate requires a positive integer")
+                sys.exit(1)
+            remaining = remaining[2:]
+        if len(remaining) > 1:
+            print("Usage: python manager.py verify-bilibili --uploader <name> [--min-bitrate <bps>] [input-dir]")
+            sys.exit(1)
+        input_dir = remaining[0] if remaining else None
+        sys.exit(1 if verify_bilibili_media(uploader, input_dir, min_bitrate) else 0)
     else:
         print("Unknown command")

@@ -33,6 +33,13 @@ python scripts/manager.py list
 
 # 整理元信息 + 获取歌词
 python scripts/manager.py fix
+
+# 暂存 Bilibili 可用的高码率音频，并写入原生封面
+python scripts/manager.py refresh-bilibili --uploader "<uploader>" ./audio-bilibili-192k
+python scripts/manager.py fix-bilibili-covers --uploader "<uploader>" ./audio-bilibili-192k
+
+# 导入 Music 前验证码率、原生封面和标签
+python scripts/manager.py verify-bilibili --uploader "<uploader>" ./audio-bilibili-192k
 ```
 
 ## 脱敏约束
@@ -51,6 +58,7 @@ python scripts/manager.py fix
 3. **代码保持通用**：
    - 使用相对路径或基于脚本位置的动态路径
    - 不要硬编码任何用户特定的配置
+   - 公开文档和 skill 只能使用 `<uploader>`、`<source-dir>` 等占位符；不得写入实际上传者、链接、BV 号、Apple ID 或 Music 资料库路径
 
 ## Library Schema
 
