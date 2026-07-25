@@ -3,6 +3,10 @@ audio/
 downloads/
 metadata/
 
+# Local media staging directories
+audio-bilibili-*/
+apple-music-compatible/
+
 # Logs and task files
 *.log
 download.log
